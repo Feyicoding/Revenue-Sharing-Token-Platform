@@ -593,3 +593,187 @@
       )
     )
   )
+  )
+
+;; Helper to check if verification is an approval
+(define-private (is-approval 
+  (verification { verifier: principal, approved: bool, timestamp: uint, comments: (string-utf8 128) }))
+  
+  (get approved verification)
+)
+
+;; Distribute revenue to token holders
+(define-private (distribute-revenue (report-id uint))
+  (let (
+    (report (unwrap! (map-get? revenue-reports { report-id: report-id }) err-report-not-found))
+    (project-id (get project-id report))
+    (project (unwrap! (map-get? projects { project-id: project-id }) err-project-not-found))
+    (amount (get amount report))
+    (revenue-share (/ (* amount (get revenue-percentage project)) u10000))
+    (total-supply (get total-supply project))
+  )
+    ;; Mark distribution as in progress
+    (map-set revenue-reports
+      { report-id: report-id }
+      (merge report { 
+        distribution-completed: true,
+        distribution-block: (some block-height)
+      })
+    )
+    
+    ;; Update project distributed amount
+    (map-set projects
+      { project-id: project-id }
+      (merge project {
+        total-revenue-distributed: (+ (get total-revenue-distributed project) revenue-share)
+      })
+    )
+    
+    (ok { report-id: report-id, status: "distributed", amount: revenue-share })
+  )
+)
+
+;; Claim revenue share as a token holder
+(define-public (claim-revenue (report-id uint))
+  (let (
+    (claimer tx-sender)
+    (report (unwrap! (map-get? revenue-reports { report-id: report-id }) err-report-not-found))
+    (project-id (get project-id report))
+    (project (unwrap! (map-get? projects { project-id: project-id }) err-project-not-found))
+  )
+    ;; Validation
+    (asserts! (is-eq (get status report) u3) err-verification-failed) ;; Report must be verified
+    (asserts! (get distribution-completed report) err-verification-in-progress) ;; Distribution must be completed
+    
+    ;; Check if already claimed
+    (let (
+      (claim (map-get? revenue-claims { report-id: report-id, token-holder: claimer }))
+    )
+      (asserts! (or (is-none claim) (not (get claimed (default-to { claimed: false } claim)))) err-already-claimed)
+      
+      ;; Calculate share based on token holdings
+      (let (
+        (holder-balance (default-to { amount: u0 } (map-get? token-balances { project-id: project-id, owner: claimer })))
+        (token-amount (get amount holder-balance))
+        (total-supply (get total-supply project))
+        (amount (get amount report))
+        (revenue-share (/ (* amount (get revenue-percentage project)) u10000))
+        (holder-share (/ (* revenue-share token-amount) total-supply))
+      )
+        ;; Ensure there's something to claim
+        (asserts! (> holder-share u0) err-nothing-to-claim)
+        
+        ;; Transfer the share to the claimer
+        (as-contract (try! (stx-transfer? holder-share (as-contract tx-sender) claimer)))
+        
+        ;; Record the claim
+        (map-set revenue-claims
+          { report-id: report-id, token-holder: claimer }
+          {
+            amount: holder-share,
+            claimed: true,
+            claim-block: (some block-height)
+          }
+        )
+        
+        (ok { amount: holder-share })
+      )
+    )
+  )
+)
+
+;; Create a sell order for tokens on the secondary market
+(define-public (create-sell-order
+  (project-id uint)
+  (token-amount uint)
+  (price-per-token uint)
+  (expiration-blocks uint))
+  
+  (let (
+    (seller tx-sender)
+    (order-id (var-get next-order-id))
+    (project (unwrap! (map-get? projects { project-id: project-id }) err-project-not-found))
+    (total-price (* token-amount price-per-token))
+    (now block-height)
+    (expiration (+ now expiration-blocks))
+  )
+    ;; Validation
+    (asserts! (get trading-enabled project) err-not-within-trading-window) ;; Trading must be enabled
+    (asserts! (>= now (get trading-start-block project)) err-not-within-trading-window) ;; Trading must have started
+    (asserts! (> token-amount u0) err-invalid-parameters) ;; Amount must be positive
+    (asserts! (> price-per-token u0) err-invalid-parameters) ;; Price must be positive
+    
+    ;; Check seller has enough tokens
+    (let (
+      (holder-balance (default-to { amount: u0 } (map-get? token-balances { project-id: project-id, owner: seller })))
+      (token-amount-owned (get amount holder-balance))
+    )
+      (asserts! (>= token-amount-owned token-amount) err-insufficient-funds)
+      
+      ;; Calculate fees
+      (let (
+        (platform-fee (/ (* total-price (var-get platform-fee-percentage)) u10000))
+        (creator-fee (/ (* total-price (get trading-fee project)) u10000))
+      )
+        ;; Create the order
+        (map-set market-orders
+          { order-id: order-id }
+          {
+            project-id: project-id,
+            seller: seller,
+            token-amount: token-amount,
+            price-per-token: price-per-token,
+            total-price: total-price,
+            creation-block: now,
+            expiration-block: expiration,
+            status: u0, ;; Open
+            buyer: none,
+            execution-block: none,
+            platform-fee: platform-fee,
+            creator-fee: creator-fee
+          }
+        )
+        
+        ;; Update seller token balance (lock the tokens)
+        (map-set token-balances
+          { project-id: project-id, owner: seller }
+          { amount: (- token-amount-owned token-amount) }
+        )
+        
+        ;; Add to seller's orders
+        (let (
+          (seller-orders (default-to { order-ids: (list) } (map-get? user-orders { user: seller })))
+          (updated-orders (append (get order-ids seller-orders) order-id))
+        )
+          (map-set user-orders
+            { user: seller }
+            { order-ids: updated-orders }
+          )
+        )
+        
+        ;; Add to project orders
+        (let (
+          (project-order-list (default-to { order-ids: (list) } (map-get? project-orders { project-id: project-id })))
+          (updated-orders (append (get order-ids project-order-list) order-id))
+        )
+          (map-set project-orders
+            { project-id: project-id }
+            { order-ids: updated-orders }
+          )
+        )
+        
+        ;; Increment order ID
+        (var-set next-order-id (+ order-id u1))
+        
+        (ok { 
+          order-id: order-id, 
+          token-amount: token-amount, 
+          total-price: total-price,
+          platform-fee: platform-fee,
+          creator-fee: creator-fee
+        })
+      )
+    )
+  )
+)
+
