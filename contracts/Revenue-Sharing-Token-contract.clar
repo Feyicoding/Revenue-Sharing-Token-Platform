@@ -175,3 +175,217 @@
   { project-id: uint }
   { order-ids: (list 200 uint) }
 )
+
+;; Audit records
+(define-map audits
+  { audit-id: uint }
+  {
+    project-id: uint,
+    auditor: principal,
+    audit-type: (string-ascii 20), ;; "financial", "technical", "compliance"
+    start-block: uint,
+    completion-block: (optional uint),
+    status: uint,
+    findings: (list 10 {
+      category: (string-ascii 20),
+      severity: uint, ;; 1-5 scale
+      description: (string-utf8 256),
+      recommendation: (string-utf8 256)
+    }),
+    report-url: (optional (string-utf8 256)),
+    summary: (string-utf8 256)
+  }
+)
+
+;; Project audits index
+(define-map project-audits
+  { project-id: uint }
+  { audit-ids: (list 50 uint) }
+)
+
+;; Authorized verifiers
+(define-map authorized-verifiers
+  { verifier: principal }
+  {
+    authorized: bool,
+    verification-count: uint,
+    staked-amount: uint,
+    accuracy-score: uint, ;; 0-100
+    specialties: (list 5 (string-ascii 32)),
+    last-active: uint
+  }
+)
+
+;; Initialize platform
+(define-public (initialize (treasury principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set treasury-address treasury)
+    (var-set platform-fee-percentage u200) ;; 2%
+    (var-set verification-period u72) ;; ~12 hours
+    (var-set min-verification-threshold u3)
+    (var-set emergency-halt false)
+    
+    ;; Mint platform tokens
+    (try! (ft-mint? platform-token (var-get platform-token-supply) treasury))
+    
+    (ok true)
+  )
+)
+
+;; Create a new revenue-sharing project
+(define-public (create-project
+  (name (string-ascii 64))
+  (description (string-utf8 256))
+  (token-symbol (string-ascii 10))
+  (total-supply uint)
+  (revenue-percentage uint)
+  (revenue-period uint)
+  (duration uint)
+  (token-price uint)
+  (min-investment uint)
+  (max-investment uint)
+  (trading-enabled bool)
+  (trading-delay uint)
+  (trading-fee uint)
+  (metadata-url (string-utf8 256))
+  (category (string-ascii 32))
+  (verifiers (list 10 principal)))
+  
+  (let (
+    (project-id (var-get next-project-id))
+    (creator tx-sender)
+    (now block-height)
+  )
+    ;; Parameter validation
+    (asserts! (> total-supply u0) err-invalid-parameters)
+    (asserts! (<= total-supply (var-get max-token-supply)) err-exceeds-platform-limit)
+    (asserts! (> token-price u0) err-invalid-parameters)
+    (asserts! (<= revenue-percentage u10000) err-invalid-parameters) ;; Max 100%
+    (asserts! (> revenue-period u0) err-invalid-parameters)
+    (asserts! (> duration revenue-period) err-invalid-parameters)
+    (asserts! (<= trading-fee u1000) err-invalid-parameters) ;; Max 10%
+    (asserts! (>= (len verifiers) (var-get min-verification-threshold)) err-invalid-parameters)
+    
+    ;; Verify all verifiers are authorized
+    (asserts! (all-verifiers-authorized verifiers) err-not-authorized)
+    
+    ;; Create the project
+    (map-set projects
+      { project-id: project-id }
+      {
+        name: name,
+        description: description,
+        creator: creator,
+        token-symbol: token-symbol,
+        total-supply: total-supply,
+        tokens-issued: u0,
+        revenue-percentage: revenue-percentage,
+        revenue-period: revenue-period,
+        duration: duration,
+        start-block: now,
+        end-block: (+ now duration),
+        status: u1, ;; Active
+        total-revenue-collected: u0,
+        total-revenue-distributed: u0,
+        last-report-block: now,
+        creation-block: now,
+        token-price: token-price,
+        min-investment: min-investment,
+        max-investment: max-investment,
+        trading-enabled: trading-enabled,
+        trading-start-block: (+ now trading-delay),
+        trading-fee: trading-fee,
+        metadata-url: metadata-url,
+        category: category,
+        verifiers: verifiers
+      }
+    )
+    
+    ;; Initialize project reports list
+    (map-set project-reports
+      { project-id: project-id }
+      { report-ids: (list) }
+    )
+    
+    ;; Initialize project audit list
+    (map-set project-audits
+      { project-id: project-id }
+      { audit-ids: (list) }
+    )
+    
+    ;; Initialize creator token balance
+    (map-set token-balances
+      { project-id: project-id, owner: creator }
+      { amount: u0 }
+    )
+    
+    ;; Increment project ID counter
+    (var-set next-project-id (+ project-id u1))
+    
+    (ok project-id)
+  )
+)
+
+;; Helper to check if all verifiers are authorized
+(define-private (all-verifiers-authorized (verifiers (list 10 principal)))
+  (fold check-verifier-authorized true verifiers)
+)
+
+;; Helper to check a single verifier's authorization
+(define-private (check-verifier-authorized (result bool) (verifier principal))
+  (and result (default-to false (get authorized (map-get? authorized-verifiers { verifier: verifier }))))
+)
+
+;; Buy tokens for a project
+(define-public (buy-tokens (project-id uint) (token-amount uint))
+  (let (
+    (buyer tx-sender)
+    (project (unwrap! (map-get? projects { project-id: project-id }) err-project-not-found))
+    (total-supply (get total-supply project))
+    (tokens-issued (get tokens-issued project))
+    (remaining-tokens (- total-supply tokens-issued))
+    (token-price (get token-price project))
+    (total-cost (* token-amount token-price))
+    (min-investment (get min-investment project))
+    (max-investment (get max-investment project))
+  )
+    ;; Validation
+    (asserts! (is-eq (get status project) u1) err-project-not-active) ;; Project must be active
+    (asserts! (<= token-amount remaining-tokens) err-exceeds-allocation) ;; Can't exceed remaining tokens
+    (asserts! (>= total-cost min-investment) err-invalid-parameters) ;; Must meet minimum investment
+    (asserts! (<= total-cost max-investment) err-invalid-parameters) ;; Can't exceed maximum investment
+    
+    ;; Check buyer has enough funds
+    (asserts! (>= (stx-get-balance buyer) total-cost) err-insufficient-funds)
+    
+    ;; Transfer payment to project creator with platform fee
+    (let (
+      (platform-fee (/ (* total-cost (var-get platform-fee-percentage)) u10000))
+      (creator-amount (- total-cost platform-fee))
+    )
+      ;; Transfer fees
+      (try! (stx-transfer? platform-fee buyer (var-get treasury-address)))
+      (try! (stx-transfer? creator-amount buyer (get creator project)))
+      
+      ;; Update token balance
+      (let (
+        (current-balance (default-to { amount: u0 } (map-get? token-balances { project-id: project-id, owner: buyer })))
+        (new-balance (+ (get amount current-balance) token-amount))
+      )
+        (map-set token-balances
+          { project-id: project-id, owner: buyer }
+          { amount: new-balance }
+        )
+      )
+      
+      ;; Update project tokens issued
+      (map-set projects
+        { project-id: project-id }
+        (merge project { tokens-issued: (+ tokens-issued token-amount) })
+      )
+      
+      (ok { tokens: token-amount, cost: total-cost, fee: platform-fee })
+    )
+  )
+)
