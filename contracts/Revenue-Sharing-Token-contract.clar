@@ -389,3 +389,207 @@
     )
   )
 )
+;; Report revenue for a project
+(define-public (report-revenue 
+  (project-id uint) 
+  (amount uint) 
+  (period-start uint) 
+  (period-end uint)
+  (supporting-docs (list 5 (string-utf8 256))))
+  
+  (let (
+    (reporter tx-sender)
+    (project (unwrap! (map-get? projects { project-id: project-id }) err-project-not-found))
+    (creator (get creator project))
+    (report-id (var-get next-report-id))
+    (verification-end (+ block-height (var-get verification-period)))
+  )
+    ;; Validation
+    (asserts! (is-eq reporter creator) err-not-authorized) ;; Only creator can report
+    (asserts! (is-eq (get status project) u1) err-project-not-active) ;; Project must be active
+    (asserts! (< block-height (get end-block project)) err-project-not-active) ;; Project must not have ended
+    (asserts! (> period-end period-start) err-invalid-parameters) ;; Valid period
+    (asserts! (<= period-end block-height) err-invalid-report-period) ;; Can't report future revenue
+    (asserts! (> amount u0) err-invalid-parameters) ;; Amount must be positive
+    
+    ;; Ensure period doesn't overlap with previous reports
+    (asserts! (>= period-start (get last-report-block project)) err-invalid-report-period)
+    
+    ;; Transfer the revenue share to the contract
+    (let (
+      (revenue-share (/ (* amount (get revenue-percentage project)) u10000))
+    )
+      ;; Transfer revenue share to contract
+      (try! (stx-transfer? revenue-share reporter (as-contract tx-sender)))
+      
+      ;; Create the revenue report
+      (map-set revenue-reports
+        { report-id: report-id }
+        {
+          project-id: project-id,
+          amount: amount,
+          period-start: period-start,
+          period-end: period-end,
+          submission-block: block-height,
+          status: u1, ;; Verification
+          verification-end-block: verification-end,
+          verifications: (list),
+          distribution-completed: false,
+          supporting-documents: supporting-docs,
+          distribution-block: none,
+          disputed-by: none
+        }
+      )
+      
+      ;; Add report to project reports
+      (let (
+        (project-report-list (get report-ids (default-to { report-ids: (list) } 
+                                              (map-get? project-reports { project-id: project-id }))))
+      )
+        (map-set project-reports
+          { project-id: project-id }
+          { report-ids: (append project-report-list report-id) }
+        )
+      )
+      
+      ;; Update project
+      (map-set projects
+        { project-id: project-id }
+        (merge project {
+          total-revenue-collected: (+ (get total-revenue-collected project) amount),
+          last-report-block: period-end
+        })
+      )
+      
+      ;; Increment report ID
+      (var-set next-report-id (+ report-id u1))
+      
+      (ok { 
+        report-id: report-id, 
+        revenue-share: revenue-share, 
+        verification-end: verification-end 
+      })
+    )
+  )
+)
+
+;; Verify a revenue report
+(define-public (verify-report (report-id uint) (approved bool) (comments (string-utf8 128)))
+  (let (
+    (verifier tx-sender)
+    (report (unwrap! (map-get? revenue-reports { report-id: report-id }) err-report-not-found))
+    (project-id (get project-id report))
+    (project (unwrap! (map-get? projects { project-id: project-id }) err-project-not-found))
+    (verifiers (get verifiers project))
+    (verification-end (get verification-end-block report))
+  )
+    ;; Validation
+    (asserts! (is-some (index-of verifiers verifier)) err-not-authorized) ;; Must be an authorized verifier
+    (asserts! (is-eq (get status report) u1) err-verification-failed) ;; Report must be in verification state
+    (asserts! (< block-height verification-end) err-verification-period-ended) ;; Verification period must be active
+    
+    ;; Check if verifier has already verified
+    (asserts! (is-none (find-verifier (get verifications report) verifier)) err-already-claimed)
+    
+    ;; Add verification
+    (let (
+      (current-verifications (get verifications report))
+      (new-verification {
+        verifier: verifier,
+        approved: approved,
+        timestamp: block-height,
+        comments: comments
+      })
+      (updated-verifications (append current-verifications new-verification))
+      (verifier-record (unwrap! (map-get? authorized-verifiers { verifier: verifier }) err-not-authorized))
+    )
+      ;; Update verifier stats
+      (map-set authorized-verifiers
+        { verifier: verifier }
+        (merge verifier-record {
+          verification-count: (+ (get verification-count verifier-record) u1),
+          last-active: block-height
+        })
+      )
+      
+      ;; Update report
+      (map-set revenue-reports
+        { report-id: report-id }
+        (merge report { verifications: updated-verifications })
+      )
+      
+      ;; Check if enough verifications to finalize
+      (if (>= (len updated-verifications) (var-get min-verification-threshold))
+        (finalize-report report-id)
+        (ok { report-id: report-id, status: "pending" })
+      )
+    )
+  )
+)
+
+;; Helper to find a verifier in the verification list
+(define-private (find-verifier 
+  (verifications (list 10 { verifier: principal, approved: bool, timestamp: uint, comments: (string-utf8 128) }))
+  (target-verifier principal))
+  
+  (filter is-target-verifier verifications)
+)
+
+;; Helper to check if verifier matches target
+(define-private (is-target-verifier 
+  (verification { verifier: principal, approved: bool, timestamp: uint, comments: (string-utf8 128) }))
+  
+  (is-eq (get verifier verification) target-verifier)
+)
+
+;; Finalize report after verification
+(define-private (finalize-report (report-id uint))
+  (let (
+    (report (unwrap! (map-get? revenue-reports { report-id: report-id }) err-report-not-found))
+    (verifications (get verifications report))
+    (approvals (filter is-approval verifications))
+    (approval-count (len approvals))
+    (verification-count (len verifications))
+    (approved (>= (* approval-count u100) (* verification-count u60))) ;; >60% approval rate
+  )
+    (if approved
+      (let (
+        (project-id (get project-id report))
+        (project (unwrap! (map-get? projects { project-id: project-id }) err-project-not-found))
+      )
+        ;; Mark report as verified
+        (map-set revenue-reports
+          { report-id: report-id }
+          (merge report { 
+            status: u3, ;; Verified
+            distribution-completed: false
+          })
+        )
+        
+        ;; Calculate and distribute revenue shares
+        (distribute-revenue report-id)
+      )
+      ;; Mark report as rejected
+      (begin
+        (map-set revenue-reports
+          { report-id: report-id }
+          (merge report { 
+            status: u4, ;; Rejected
+            distribution-completed: false
+          })
+        )
+        
+        ;; Refund the escrowed revenue to the project creator
+        (let (
+          (project-id (get project-id report))
+          (project (unwrap! (map-get? projects { project-id: project-id }) err-project-not-found))
+          (amount (get amount report))
+          (revenue-share (/ (* amount (get revenue-percentage project)) u10000))
+        )
+          (as-contract (stx-transfer? revenue-share (as-contract tx-sender) (get creator project)))
+        )
+        
+        (ok { report-id: report-id, status: "rejected" })
+      )
+    )
+  )
