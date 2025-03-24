@@ -776,4 +776,551 @@
     )
   )
 )
+;; Fill a sell order (buy tokens)
+(define-public (fill-order (order-id uint))
+  (let (
+    (buyer tx-sender)
+    (order (unwrap! (map-get? market-orders { order-id: order-id }) err-order-not-found))
+    (project-id (get project-id order))
+    (project (unwrap! (map-get? projects { project-id: project-id }) err-project-not-found))
+    (seller (get seller order))
+    (token-amount (get token-amount order))
+    (total-price (get total-price order))
+    (platform-fee (get platform-fee order))
+    (creator-fee (get creator-fee order))
+    (payment-amount (+ total-price platform-fee creator-fee))
+  )
+    ;; Validation
+    (asserts! (not (is-eq buyer seller)) err-self-trade) ;; Can't buy from self
+    (asserts! (is-eq (get status order) u0) err-invalid-order-state) ;; Order must be open
+    (asserts! (< block-height (get expiration-block order)) err-invalid-order-state) ;; Order must not be expired
+    
+    ;; Check buyer has enough funds
+    (asserts! (>= (stx-get-balance buyer) payment-amount) err-insufficient-funds)
+    
+    ;; Transfer funds
+    (try! (stx-transfer? total-price buyer seller)) ;; Pay seller
+    (try! (stx-transfer? platform-fee buyer (var-get treasury-address))) ;; Pay platform fee
+    (try! (stx-transfer? creator-fee buyer (get creator project))) ;; Pay creator fee
+    
+    ;; Update buyer's token balance
+    (let (
+      (buyer-balance (default-to { amount: u0 } (map-get? token-balances { project-id: project-id, owner: buyer })))
+      (new-balance (+ (get amount buyer-balance) token-amount))
+    )
+      (map-set token-balances
+        { project-id: project-id, owner: buyer }
+        { amount: new-balance }
+      )
+    )
+    
+    ;; Update order status
+    (map-set market-orders
+      { order-id: order-id }
+      (merge order {
+        status: u1, ;; Filled
+        buyer: (some buyer),
+        execution-block: (some block-height)
+      })
+    )
+    
+    (ok { 
+      order-id: order-id, 
+      token-amount: token-amount, 
+      total-price: total-price,
+      platform-fee: platform-fee,
+      creator-fee: creator-fee
+    })
+  )
+)
 
+;; Cancel a sell order
+(define-public (cancel-order (order-id uint))
+  (let (
+    (seller tx-sender)
+    (order (unwrap! (map-get? market-orders { order-id: order-id }) err-order-not-found))
+    (project-id (get project-id order))
+  )
+    ;; Validation
+    (asserts! (is-eq seller (get seller order)) err-not-authorized) ;; Only seller can cancel
+    (asserts! (is-eq (get status order) u0) err-invalid-order-state) ;; Order must be open
+    
+    ;; Return tokens to seller
+    (let (
+      (token-amount (get token-amount order))
+      (seller-balance (default-to { amount: u0 } (map-get? token-balances { project-id: project-id, owner: seller })))
+      (new-balance (+ (get amount seller-balance) token-amount))
+    )
+      (map-set token-balances
+        { project-id: project-id, owner: seller }
+        { amount: new-balance }
+      )
+    )
+    
+    ;; Update order status
+    (map-set market-orders
+      { order-id: order-id }
+      (merge order {
+        status: u2 ;; Cancelled
+      })
+    )
+    
+    (ok { order-id: order-id })
+  )
+)
+
+;; Process expired orders
+(define-public (process-expired-order (order-id uint))
+  (let (
+    (processor tx-sender)
+    (order (unwrap! (map-get? market-orders { order-id: order-id }) err-order-not-found))
+    (project-id (get project-id order))
+    (seller (get seller order))
+  )
+    ;; Validation
+    (asserts! (is-eq (get status order) u0) err-invalid-order-state) ;; Order must be open
+    (asserts! (>= block-height (get expiration-block order)) err-invalid-order-state) ;; Order must be expired
+    
+    ;; Return tokens to seller
+    (let (
+      (token-amount (get token-amount order))
+      (seller-balance (default-to { amount: u0 } (map-get? token-balances { project-id: project-id, owner: seller })))
+      (new-balance (+ (get amount seller-balance) token-amount))
+    )
+      (map-set token-balances
+        { project-id: project-id, owner: seller }
+        { amount: new-balance }
+      )
+    )
+    
+    ;; Update order status
+    (map-set market-orders
+      { order-id: order-id }
+      (merge order {
+        status: u3 ;; Expired
+      })
+    )
+    
+    (ok { order-id: order-id })
+  )
+)
+
+;; Submit a project for audit
+(define-public (request-audit (project-id uint) (audit-type (string-ascii 20)))
+  (let (
+    (creator tx-sender)
+    (project (unwrap! (map-get? projects { project-id: project-id }) err-project-not-found))
+    (audit-id (var-get next-audit-id))
+  )
+    ;; Validation
+    (asserts! (is-eq creator (get creator project)) err-not-authorized) ;; Only creator can request audit
+    (asserts! (or (is-eq audit-type "financial") 
+                (is-eq audit-type "technical") 
+                (is-eq audit-type "compliance")) 
+              err-invalid-parameters) ;; Valid audit type
+    
+    ;; Create audit record
+    (map-set audits
+      { audit-id: audit-id }
+      {
+        project-id: project-id,
+        auditor: contract-owner, ;; Initially assigned to contract owner, will be reassigned
+        audit-type: audit-type,
+        start-block: block-height,
+        completion-block: none,
+        status: u0, ;; Pending
+        findings: (list),
+        report-url: none,
+        summary: "Audit requested and pending assignment."
+      }
+    )
+    
+    ;; Add audit to project audits
+    (let (
+      (project-audit-list (get audit-ids (default-to { audit-ids: (list) } 
+                                         (map-get? project-audits { project-id: project-id }))))
+    )
+      (map-set project-audits
+        { project-id: project-id }
+        { audit-ids: (append project-audit-list audit-id) }
+      )
+    )
+    
+    ;; Increment audit ID
+    (var-set next-audit-id (+ audit-id u1))
+    
+    (ok { audit-id: audit-id })
+  )
+)
+
+;; Assign auditor to an audit
+(define-public (assign-auditor (audit-id uint) (auditor principal))
+  (let (
+    (admin tx-sender)
+    (audit (unwrap! (map-get? audits { audit-id: audit-id }) err-audit-not-found))
+  )
+    ;; Validation
+    (asserts! (is-eq admin contract-owner) err-not-authorized) ;; Only platform owner can assign
+    (asserts! (is-eq (get status audit) u0) err-audit-in-progress) ;; Audit must be pending
+    
+    ;; Update audit record
+    (map-set audits
+      { audit-id: audit-id }
+      (merge audit {
+        auditor: auditor,
+        status: u1, ;; In Progress
+        summary: "Audit assigned and in progress."
+      })
+    )
+    
+    (ok { audit-id: audit-id, auditor: auditor })
+  )
+)
+
+;; Submit audit findings
+(define-public (submit-audit-findings 
+  (audit-id uint) 
+  (findings (list 10 { category: (string-ascii 20), severity: uint, description: (string-utf8 256), recommendation: (string-utf8 256) }))
+  (report-url (string-utf8 256))
+  (summary (string-utf8 256)))
+  
+  (let (
+    (auditor tx-sender)
+    (audit (unwrap! (map-get? audits { audit-id: audit-id }) err-audit-not-found))
+  )
+    ;; Validation
+    (asserts! (is-eq auditor (get auditor audit)) err-not-authorized) ;; Only assigned auditor can submit
+    (asserts! (is-eq (get status audit) u1) err-invalid-audit-data) ;; Audit must be in progress
+    
+    ;; Update audit record
+    (map-set audits
+      { audit-id: audit-id }
+      (merge audit {
+        completion-block: (some block-height),
+        status: u2, ;; Completed
+        findings: findings,
+        report-url: (some report-url),
+        summary: summary
+      })
+    )
+    
+    (ok { audit-id: audit-id })
+  )
+)
+
+;; Authorize a verifier
+(define-public (authorize-verifier (verifier principal) (specialties (list 5 (string-ascii 32))))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    
+    (map-set authorized-verifiers
+      { verifier: verifier }
+      {
+        authorized: true,
+        verification-count: u0,
+        staked-amount: u0,
+        accuracy-score: u70, ;; Start with a neutral score
+        specialties: specialties,
+        last-active: block-height
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Deauthorize a verifier
+(define-public (deauthorize-verifier (verifier principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    
+    (let (
+      (verifier-info (unwrap! (map-get? authorized-verifiers { verifier: verifier }) err-not-authorized))
+    )
+      (map-set authorized-verifiers
+        { verifier: verifier }
+        (merge verifier-info { authorized: false })
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Stake tokens as a verifier
+(define-public (stake-as-verifier (amount uint))
+  (let (
+    (verifier tx-sender)
+    (verifier-info (unwrap! (map-get? authorized-verifiers { verifier: verifier }) err-not-authorized))
+  )
+    ;; Validate verifier is authorized
+    (asserts! (get authorized verifier-info) err-not-authorized)
+    
+    ;; Check verifier has enough platform tokens
+    (asserts! (>= (ft-get-balance platform-token verifier) amount) err-insufficient-funds)
+    
+    ;; Transfer tokens to contract
+    (try! (ft-transfer? platform-token amount verifier (as-contract tx-sender)))
+    
+    ;; Update verifier staked amount
+    (map-set authorized-verifiers
+      { verifier: verifier }
+      (merge verifier-info {
+        staked-amount: (+ (get staked-amount verifier-info) amount)
+      })
+    )
+    
+    (ok { staked: amount })
+  )
+)
+
+;; Unstake tokens as a verifier
+(define-public (unstake-as-verifier (amount uint))
+  (let (
+    (verifier tx-sender)
+    (verifier-info (unwrap! (map-get? authorized-verifiers { verifier: verifier }) err-not-authorized))
+    (staked-amount (get staked-amount verifier-info))
+  )
+    ;; Validate verifier has enough staked
+    (asserts! (>= staked-amount amount) err-insufficient-funds)
+    
+    ;; Transfer tokens back to verifier
+    (as-contract (try! (ft-transfer? platform-token amount (as-contract tx-sender) verifier)))
+    
+    ;; Update verifier staked amount
+    (map-set authorized-verifiers
+      { verifier: verifier }
+      (merge verifier-info {
+        staked-amount: (- staked-amount amount)
+      })
+    )
+    
+    (ok { unstaked: amount })
+  )
+)
+
+;; Update project status
+(define-public (update-project-status (project-id uint) (new-status uint))
+  (let (
+    (admin tx-sender)
+    (project (unwrap! (map-get? projects { project-id: project-id }) err-project-not-found))
+  )
+    ;; Validation
+    (asserts! (or (is-eq admin contract-owner) (is-eq admin (get creator project))) err-not-authorized)
+    (asserts! (< new-status u5) err-invalid-parameters) ;; Valid status
+    
+    ;; Update project
+    (map-set projects
+      { project-id: project-id }
+      (merge project { status: new-status })
+    )
+    
+    (ok { project-id: project-id, status: new-status })
+  )
+)
+
+;; Dispute a revenue report
+(define-public (dispute-report (report-id uint) (reason (string-utf8 128)))
+  (let (
+    (disputer tx-sender)
+    (report (unwrap! (map-get? revenue-reports { report-id: report-id }) err-report-not-found))
+    (project-id (get project-id report))
+    (project (unwrap! (map-get? projects { project-id: project-id }) err-project-not-found))
+  )
+    ;; Validation
+    (asserts! (is-eq (get status report) u1) err-verification-failed) ;; Report must be in verification
+    (asserts! (< block-height (get verification-end-block report)) err-verification-period-ended)
+    
+    ;; Check if disputer holds tokens
+    (let (
+      (holder-balance (default-to { amount: u0 } (map-get? token-balances { project-id: project-id, owner: disputer })))
+      (token-amount (get amount holder-balance))
+    )
+      (asserts! (> token-amount u0) err-not-authorized) ;; Must hold tokens to dispute
+      
+      ;; Update report
+      (map-set revenue-reports
+        { report-id: report-id }
+        (merge report {
+          status: u2, ;; Disputed
+          disputed-by: (some disputer)
+        })
+      )
+      
+      (ok { report-id: report-id, status: "disputed" })
+    )
+  )
+)
+
+;; Emergency shutdown of the platform
+(define-public (emergency-shutdown (enable bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set emergency-halt enable)
+    (ok enable)
+  )
+)
+
+;; Transfer tokens between users
+(define-public (transfer-tokens (project-id uint) (recipient principal) (amount uint))
+  (let (
+    (sender tx-sender)
+    (project (unwrap! (map-get? projects { project-id: project-id }) err-project-not-found))
+    (sender-balance (default-to { amount: u0 } (map-get? token-balances { project-id: project-id, owner: sender })))
+    (recipient-balance (default-to { amount: u0 } (map-get? token-balances { project-id: project-id, owner: recipient })))
+  )
+    ;; Validation
+    (asserts! (get trading-enabled project) err-not-within-trading-window) ;; Trading must be enabled
+    (asserts! (>= block-height (get trading-start-block project)) err-not-within-trading-window)
+    (asserts! (>= (get amount sender-balance) amount) err-insufficient-funds)
+    
+    ;; Update balances
+    (map-set token-balances
+      { project-id: project-id, owner: sender }
+      { amount: (- (get amount sender-balance) amount) }
+    )
+    
+    (map-set token-balances
+      { project-id: project-id, owner: recipient }
+      { amount: (+ (get amount recipient-balance) amount) }
+    )
+    
+    (ok { amount: amount })
+  )
+)
+
+;; Read-only functions
+
+;; Get project details
+(define-read-only (get-project (project-id uint))
+  (map-get? projects { project-id: project-id })
+)
+
+;; Get user token balance
+(define-read-only (get-token-balance (project-id uint) (owner principal))
+  (default-to { amount: u0 } (map-get? token-balances { project-id: project-id, owner: owner }))
+)
+
+;; Get revenue report details
+(define-read-only (get-revenue-report (report-id uint))
+  (map-get? revenue-reports { report-id: report-id })
+)
+
+;; Get project reports
+(define-read-only (get-project-report-ids (project-id uint))
+  (get report-ids (default-to { report-ids: (list) } (map-get? project-reports { project-id: project-id })))
+)
+
+;; Get claim status
+(define-read-only (get-claim-status (report-id uint) (token-holder principal))
+  (map-get? revenue-claims { report-id: report-id, token-holder: token-holder })
+)
+
+;; Get market order details
+(define-read-only (get-market-order (order-id uint))
+  (map-get? market-orders { order-id: order-id })
+)
+
+;; Get user orders
+(define-read-only (get-user-order-ids (user principal))
+  (get order-ids (default-to { order-ids: (list) } (map-get? user-orders { user: user })))
+)
+
+;; Get project orders
+(define-read-only (get-project-order-ids (project-id uint))
+  (get order-ids (default-to { order-ids: (list) } (map-get? project-orders { project-id: project-id })))
+)
+
+;; Get audit details
+(define-read-only (get-audit (audit-id uint))
+  (map-get? audits { audit-id: audit-id })
+)
+
+;; Get project audit IDs
+(define-read-only (get-project-audit-ids (project-id uint))
+  (get audit-ids (default-to { audit-ids: (list) } (map-get? project-audits { project-id: project-id })))
+)
+
+;; Get verifier info
+(define-read-only (get-verifier-info (verifier principal))
+  (map-get? authorized-verifiers { verifier: verifier })
+)
+
+;; Get platform parameters
+(define-read-only (get-platform-parameters)
+  {
+    platform-fee-percentage: (var-get platform-fee-percentage),
+    verification-period: (var-get verification-period),
+    min-verification-threshold: (var-get min-verification-threshold),
+    max-token-supply: (var-get max-token-supply),
+    emergency-halt: (var-get emergency-halt)
+  }
+)
+
+;; Get project status as string
+(define-read-only (get-project-status-string (project-id uint))
+  (let (
+    (project (map-get? projects { project-id: project-id }))
+  )
+    (if (is-some project)
+      (let (
+        (status (get status (unwrap-panic project)))
+        (status-list (var-get project-statuses))
+      )
+        (default-to "Unknown" (element-at status-list status))
+      )
+      "Not Found"
+    )
+  )
+)
+
+;; Get report status as string
+(define-read-only (get-report-status-string (report-id uint))
+  (let (
+    (report (map-get? revenue-reports { report-id: report-id }))
+  )
+    (if (is-some report)
+      (let (
+        (status (get status (unwrap-panic report)))
+        (status-list (var-get report-statuses))
+      )
+        (default-to "Unknown" (element-at status-list status))
+      )
+      "Not Found"
+    )
+  )
+)
+
+;; Get order status as string
+(define-read-only (get-order-status-string (order-id uint))
+  (let (
+    (order (map-get? market-orders { order-id: order-id }))
+  )
+    (if (is-some order)
+      (let (
+        (status (get status (unwrap-panic order)))
+        (status-list (var-get order-statuses))
+      )
+        (default-to "Unknown" (element-at status-list status))
+      )
+      "Not Found"
+    )
+  )
+)
+
+;; Get audit status as string
+(define-read-only (get-audit-status-string (audit-id uint))
+  (let (
+    (audit (map-get? audits { audit-id: audit-id }))
+  )
+    (if (is-some audit)
+      (let (
+        (status (get status (unwrap-panic audit)))
+        (status-list (var-get audit-statuses))
+      )
+        (default-to "Unknown" (element-at status-list status))
+      )
+      "Not Found"
+    )
+  )
+)
