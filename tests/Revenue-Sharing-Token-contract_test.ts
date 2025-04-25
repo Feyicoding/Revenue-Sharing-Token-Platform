@@ -816,3 +816,481 @@ Clarinet.test({
       [types.uint(1), types.principal(recipient.address)],
       deployer.address
     );
+     
+    assertEquals(holderBalance.result.expectTuple()['amount'], '1000');
+    assertEquals(recipientBalance.result.expectTuple()['amount'], '0');
+    
+    // Transfer tokens directly
+    let block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'transfer-tokens', [
+        types.uint(1), // project_id
+        types.principal(recipient.address), // recipient
+        types.uint(500) // amount
+      ], tokenHolder.address)
+    ]);
+    
+    // Check transfer success
+    assertEquals(block.receipts[0].result, '(ok (amount u500))');
+    
+    // Verify updated balances
+    holderBalance = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-token-balance',
+      [types.uint(1), types.principal(tokenHolder.address)],
+      deployer.address
+    );
+    
+    recipientBalance = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-token-balance',
+      [types.uint(1), types.principal(recipient.address)],
+      deployer.address
+    );
+    
+    assertEquals(holderBalance.result.expectTuple()['amount'], '500');
+    assertEquals(recipientBalance.result.expectTuple()['amount'], '500');
+  }
+});
+
+Clarinet.test({
+  name: "Revenue report dispute mechanism works correctly",
+  async fn(chain: Chain, accounts: Map<string, Account>) {
+    const deployer = accounts.get('deployer')!;
+    const treasury = accounts.get('wallet_1')!;
+    const projectCreator = accounts.get('wallet_2')!;
+    const verifier1 = accounts.get('wallet_3')!;
+    const verifier2 = accounts.get('wallet_4')!;
+    const verifier3 = accounts.get('wallet_5')!;
+    const tokenHolder = accounts.get('wallet_6')!;
+    
+    // Setup platform, project, and token holdings
+    chain.mineBlock([
+      // Initialize platform
+      Tx.contractCall('revenue-sharing-token-platform', 'initialize', [
+        types.principal(treasury.address)
+      ], deployer.address),
+      
+      // Authorize verifiers
+      Tx.contractCall('revenue-sharing-token-platform', 'authorize-verifier', [
+        types.principal(verifier1.address),
+        types.list([types.ascii("finance"), types.ascii("technical")])
+      ], deployer.address),
+      Tx.contractCall('revenue-sharing-token-platform', 'authorize-verifier', [
+        types.principal(verifier2.address),
+        types.list([types.ascii("finance"), types.ascii("compliance")])
+      ], deployer.address),
+      Tx.contractCall('revenue-sharing-token-platform', 'authorize-verifier', [
+        types.principal(verifier3.address),
+        types.list([types.ascii("compliance"), types.ascii("technical")])
+      ], deployer.address),
+      
+      // Create project
+      Tx.contractCall('revenue-sharing-token-platform', 'create-project', [
+        types.ascii("Test Project"), // name
+        types.utf8("Test description"), // description
+        types.ascii("TEST"), // token-symbol
+        types.uint(10000000), // total-supply
+        types.uint(2000), // revenue-percentage
+        types.uint(4320), // revenue-period
+        types.uint(518400), // duration
+        types.uint(1000000), // token-price
+        types.uint(50000000), // min-investment
+        types.uint(5000000000), // max-investment
+        types.bool(true), // trading-enabled
+        types.uint(0), // trading-delay
+        types.uint(300), // trading-fee
+        types.utf8("https://example.com/metadata"), // metadata-url
+        types.ascii("test"), // category
+        types.list([
+          types.principal(verifier1.address),
+          types.principal(verifier2.address),
+          types.principal(verifier3.address)
+        ]) // verifiers
+      ], projectCreator.address),
+      
+      // Token holder buys tokens
+      Tx.contractCall('revenue-sharing-token-platform', 'buy-tokens', [
+        types.uint(1), // project_id
+        types.uint(1000) // token_amount
+      ], tokenHolder.address)
+    ]);
+    
+    // Project creator reports revenue
+    let block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'report-revenue', [
+        types.uint(1), // project_id
+        types.uint(5000000000), // amount (5000 STX)
+        types.uint(1), // period_start (block height)
+        types.uint(10), // period_end (block height)
+        types.list([types.utf8("https://example.com/revenue-docs")])
+      ], projectCreator.address)
+    ]);
+    
+    // Check report status after creation
+    let reportStatus = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-report-status-string',
+      [types.uint(1)],
+      deployer.address
+    );
+    
+    assertEquals(reportStatus.result, '"Verification"');
+    
+    // Token holder disputes the report
+    block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'dispute-report', [
+        types.uint(1), // report_id
+        types.utf8("Revenue appears overstated") // reason
+      ], tokenHolder.address)
+    ]);
+    
+    // Check dispute success
+    assertEquals(block.receipts[0].result.expectOk().expectTuple()['status'], '"disputed"');
+    
+    // Verify report status changed to disputed
+    reportStatus = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-report-status-string',
+      [types.uint(1)],
+      deployer.address
+    );
+    
+    assertEquals(reportStatus.result, '"Disputed"');
+    
+    // Get the report details to check disputed-by field
+    let reportInfo = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-revenue-report',
+      [types.uint(1)],
+      deployer.address
+    );
+    
+    const report = reportInfo.result.expectSome().expectTuple();
+    assertEquals(report['disputed-by'], `(some ${tokenHolder.address})`);
+  }
+});
+
+Clarinet.test({
+  name: "Platform parameter validations work correctly",
+  async fn(chain: Chain, accounts: Map<string, Account>) {
+    const deployer = accounts.get('deployer')!;
+    const treasury = accounts.get('wallet_1')!;
+    const projectCreator = accounts.get('wallet_2')!;
+    const verifier1 = accounts.get('wallet_3')!;
+    
+    // Initialize platform
+    chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'initialize', [
+        types.principal(treasury.address)
+      ], deployer.address),
+      
+      // Authorize verifier
+      Tx.contractCall('revenue-sharing-token-platform', 'authorize-verifier', [
+        types.principal(verifier1.address),
+        types.list([types.ascii("finance"), types.ascii("technical")])
+      ], deployer.address)
+    ]);
+    
+    // Test invalid project parameters
+    
+    // 1. Test creating a project with revenue percentage > 100%
+    let block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'create-project', [
+        types.ascii("Invalid Project"), // name
+        types.utf8("Test description"), // description
+        types.ascii("TEST"), // token-symbol
+        types.uint(1000000), // total-supply
+        types.uint(12000), // revenue-percentage (120% - invalid)
+        types.uint(4320), // revenue-period
+        types.uint(8640), // duration
+        types.uint(1000000), // token-price
+        types.uint(50000000), // min-investment
+        types.uint(5000000000), // max-investment
+        types.bool(true), // trading-enabled
+        types.uint(0), // trading-delay
+        types.uint(300), // trading-fee
+        types.utf8("https://example.com/metadata"), // metadata-url
+        types.ascii("test"), // category
+        types.list([types.principal(verifier1.address)]) // verifiers
+      ], projectCreator.address)
+    ]);
+    
+    // Should fail with error 104 (err-invalid-parameters)
+    assertEquals(getErrCode(block.receipts[0]), 104);
+    
+    // 2. Test creating a project with duration less than revenue period
+    block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'create-project', [
+        types.ascii("Invalid Project"), // name
+        types.utf8("Test description"), // description
+        types.ascii("TEST"), // token-symbol
+        types.uint(1000000), // total-supply
+        types.uint(2000), // revenue-percentage (20%)
+        types.uint(4320), // revenue-period
+        types.uint(2000), // duration (less than revenue period - invalid)
+        types.uint(1000000), // token-price
+        types.uint(50000000), // min-investment
+        types.uint(5000000000), // max-investment
+        types.bool(true), // trading-enabled
+        types.uint(0), // trading-delay
+        types.uint(300), // trading-fee
+        types.utf8("https://example.com/metadata"), // metadata-url
+        types.ascii("test"), // category
+        types.list([types.principal(verifier1.address)]) // verifiers
+      ], projectCreator.address)
+    ]);
+    
+    // Should fail with error 104 (err-invalid-parameters)
+    assertEquals(getErrCode(block.receipts[0]), 104);
+    
+    // 3. Test creating a project with trading fee > 10%
+    block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'create-project', [
+        types.ascii("Invalid Project"), // name
+        types.utf8("Test description"), // description
+        types.ascii("TEST"), // token-symbol
+        types.uint(1000000), // total-supply
+        types.uint(2000), // revenue-percentage
+        types.uint(4320), // revenue-period
+        types.uint(8640), // duration
+        types.uint(1000000), // token-price
+        types.uint(50000000), // min-investment
+        types.uint(5000000000), // max-investment
+        types.bool(true), // trading-enabled
+        types.uint(0), // trading-delay
+        types.uint(1500), // trading-fee (15% - invalid)
+        types.utf8("https://example.com/metadata"), // metadata-url
+        types.ascii("test"), // category
+        types.list([types.principal(verifier1.address)]) // verifiers
+      ], projectCreator.address)
+    ]);
+    
+    // Should fail with error 104 (err-invalid-parameters)
+    assertEquals(getErrCode(block.receipts[0]), 104);
+  }
+});
+
+Clarinet.test({
+  name: "Order cancellation works correctly",
+  async fn(chain: Chain, accounts: Map<string, Account>) {
+    const deployer = accounts.get('deployer')!;
+    const treasury = accounts.get('wallet_1')!;
+    const projectCreator = accounts.get('wallet_2')!;
+    const verifier = accounts.get('wallet_3')!;
+    const seller = accounts.get('wallet_4')!;
+    
+    // Setup platform, project, and create a sell order
+    chain.mineBlock([
+      // Initialize platform
+      Tx.contractCall('revenue-sharing-token-platform', 'initialize', [
+        types.principal(treasury.address)
+      ], deployer.address),
+      
+      // Authorize verifier
+      Tx.contractCall('revenue-sharing-token-platform', 'authorize-verifier', [
+        types.principal(verifier.address),
+        types.list([types.ascii("finance"), types.ascii("technical")])
+      ], deployer.address),
+      
+      // Create project with immediate trading
+      Tx.contractCall('revenue-sharing-token-platform', 'create-project', [
+        types.ascii("Test Project"), // name
+        types.utf8("Test description"), // description
+        types.ascii("TEST"), // token-symbol
+        types.uint(1000000), // total-supply
+        types.uint(2000), // revenue-percentage
+        types.uint(4320), // revenue-period
+        types.uint(8640), // duration
+        types.uint(1000000), // token-price
+        types.uint(50000000), // min-investment
+        types.uint(5000000000), // max-investment
+        types.bool(true), // trading-enabled
+        types.uint(0), // trading-delay
+        types.uint(300), // trading-fee
+        types.utf8("https://example.com/metadata"), // metadata-url
+        types.ascii("test"), // category
+        types.list([types.principal(verifier.address)]) // verifiers
+      ], projectCreator.address),
+      
+      // Seller buys tokens
+      Tx.contractCall('revenue-sharing-token-platform', 'buy-tokens', [
+        types.uint(1), // project_id
+        types.uint(1000) // token_amount
+      ], seller.address)
+    ]);
+    
+    // Create sell order
+    let block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'create-sell-order', [
+        types.uint(1), // project_id
+        types.uint(500), // token_amount
+        types.uint(1500000), // price_per_token
+        types.uint(100) // expiration_blocks
+      ], seller.address)
+    ]);
+    
+    // Check order creation
+    assertEquals(block.receipts[0].result.expectOk().expectTuple()['order-id'], '1');
+    
+    // Check seller balance (should be reduced by order amount)
+    let sellerBalance = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-token-balance',
+      [types.uint(1), types.principal(seller.address)],
+      deployer.address
+    );
+    
+    assertEquals(sellerBalance.result.expectTuple()['amount'], '500');
+    
+    // Cancel the order
+    block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'cancel-order', [
+        types.uint(1) // order_id
+      ], seller.address)
+    ]);
+    
+    // Check cancellation success
+    assertEquals(block.receipts[0].result.expectOk().expectTuple()['order-id'], '1');
+    
+    // Verify order status changed to cancelled
+    let orderInfo = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-market-order',
+      [types.uint(1)],
+      deployer.address
+    );
+    
+    const order = orderInfo.result.expectSome().expectTuple();
+    assertEquals(order['status'], '2'); // Cancelled
+    
+    // Check tokens were returned to seller
+    sellerBalance = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-token-balance',
+      [types.uint(1), types.principal(seller.address)],
+      deployer.address
+    );
+    
+    assertEquals(sellerBalance.result.expectTuple()['amount'], '1000');
+  }
+});
+
+Clarinet.test({
+  name: "Expired order processing works correctly",
+  async fn(chain: Chain, accounts: Map<string, Account>) {
+    const deployer = accounts.get('deployer')!;
+    const treasury = accounts.get('wallet_1')!;
+    const projectCreator = accounts.get('wallet_2')!;
+    const verifier = accounts.get('wallet_3')!;
+    const seller = accounts.get('wallet_4')!;
+    const processor = accounts.get('wallet_5')!;
+    
+    // Setup platform, project, and create a sell order
+    chain.mineBlock([
+      // Initialize platform
+      Tx.contractCall('revenue-sharing-token-platform', 'initialize', [
+        types.principal(treasury.address)
+      ], deployer.address),
+      
+      // Authorize verifier
+      Tx.contractCall('revenue-sharing-token-platform', 'authorize-verifier', [
+        types.principal(verifier.address),
+        types.list([types.ascii("finance"), types.ascii("technical")])
+      ], deployer.address),
+      
+      // Create project with immediate trading
+      Tx.contractCall('revenue-sharing-token-platform', 'create-project', [
+        types.ascii("Test Project"), // name
+        types.utf8("Test description"), // description
+        types.ascii("TEST"), // token-symbol
+        types.uint(1000000), // total-supply
+        types.uint(2000), // revenue-percentage
+        types.uint(4320), // revenue-period
+        types.uint(8640), // duration
+        types.uint(1000000), // token-price
+        types.uint(50000000), // min-investment
+        types.uint(5000000000), // max-investment
+        types.bool(true), // trading-enabled
+        types.uint(0), // trading-delay
+        types.uint(300), // trading-fee
+        types.utf8("https://example.com/metadata"), // metadata-url
+        types.ascii("test"), // category
+        types.list([types.principal(verifier.address)]) // verifiers
+      ], projectCreator.address),
+      
+      // Seller buys tokens
+      Tx.contractCall('revenue-sharing-token-platform', 'buy-tokens', [
+        types.uint(1), // project_id
+        types.uint(1000) // token_amount
+      ], seller.address)
+    ]);
+    
+    // Create sell order with very short expiration
+    let block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'create-sell-order', [
+        types.uint(1), // project_id
+        types.uint(500), // token_amount
+        types.uint(1500000), // price_per_token
+        types.uint(1) // expiration_blocks (very short)
+      ], seller.address)
+    ]);
+    
+    // Check order creation
+    assertEquals(block.receipts[0].result.expectOk().expectTuple()['order-id'], '1');
+    
+    // Mine a block to exceed the expiration
+    chain.mineBlock([]);
+    
+    // Check seller balance (should be reduced by order amount)
+    let sellerBalance = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-token-balance',
+      [types.uint(1), types.principal(seller.address)],
+      deployer.address
+    );
+    
+    assertEquals(sellerBalance.result.expectTuple()['amount'], '500');
+    
+    // Process expired order
+    block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'process-expired-order', [
+        types.uint(1) // order_id
+      ], processor.address)
+    ]);
+    
+    // Check processing success
+    assertEquals(block.receipts[0].result.expectOk().expectTuple()['order-id'], '1');
+    
+    // Verify order status changed to expired
+    let orderInfo = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-market-order',
+      [types.uint(1)],
+      deployer.address
+    );
+    
+    const order = orderInfo.result.expectSome().expectTuple();
+    assertEquals(order['status'], '3'); // Expired
+    
+    // Check tokens were returned to seller
+    sellerBalance = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-token-balance',
+      [types.uint(1), types.principal(seller.address)],
+      deployer.address
+    );
+    
+    assertEquals(sellerBalance.result.expectTuple()['amount'], '1000');
+    
+    // Attempting to fill an expired order should fail
+    const buyer = accounts.get('wallet_6')!;
+    block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'fill-order', [
+        types.uint(1) // order_id
+      ], buyer.address)
+    ]);
+    
+    // Should fail with error 119 (err-invalid-order-state)
+    assertEquals(getErrCode(block.receipts[0]), 119);
+  }
+});
