@@ -641,4 +641,178 @@ Clarinet.test({
       
       // Initialize platform
       chain.mineBlock([
-        Tx.contractCall(
+        Tx.contractCall('revenue-sharing-token-platform', 'initialize', [
+        types.principal(treasury.address)
+      ], deployer.address)
+    ]);
+    
+    // Authorize a verifier
+    let block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'authorize-verifier', [
+        types.principal(verifier.address),
+        types.list([types.ascii("finance"), types.ascii("compliance")])
+      ], deployer.address)
+    ]);
+    
+    // Check authorization success
+    assertEquals(block.receipts[0].result, '(ok true)');
+    
+    // Verify verifier info
+    let verifierInfo = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-verifier-info',
+      [types.principal(verifier.address)],
+      deployer.address
+    );
+    
+    const info = verifierInfo.result.expectSome().expectTuple();
+    assertEquals(info['authorized'], 'true');
+    assertEquals(info['verification-count'], '0');
+    assertEquals(info['staked-amount'], '0');
+    assertEquals(info['accuracy-score'], '70');
+    
+    // Deauthorize verifier
+    block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'deauthorize-verifier', [
+        types.principal(verifier.address)
+      ], deployer.address)
+    ]);
+    
+    // Check deauthorization success
+    assertEquals(block.receipts[0].result, '(ok true)');
+    
+    // Verify verifier status updated
+    verifierInfo = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-verifier-info',
+      [types.principal(verifier.address)],
+      deployer.address
+    );
+    
+    const updatedInfo = verifierInfo.result.expectSome().expectTuple();
+    assertEquals(updatedInfo['authorized'], 'false');
+  }
+});
+
+Clarinet.test({
+  name: "Emergency shutdown functionality works properly",
+  async fn(chain: Chain, accounts: Map<string, Account>) {
+    const deployer = accounts.get('deployer')!;
+    const treasury = accounts.get('wallet_1')!;
+    
+    // Initialize platform
+    chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'initialize', [
+        types.principal(treasury.address)
+      ], deployer.address)
+    ]);
+    
+    // Check initial emergency halt status
+    let platformParams = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-platform-parameters',
+      [],
+      deployer.address
+    );
+    
+    const initialParams = platformParams.result.expectTuple();
+    assertEquals(initialParams['emergency-halt'], 'false');
+    
+    // Enable emergency halt
+    let block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'emergency-shutdown', [
+        types.bool(true)
+      ], deployer.address)
+    ]);
+    
+    // Check shutdown success
+    assertEquals(block.receipts[0].result, '(ok true)');
+    
+    // Verify updated emergency halt status
+    platformParams = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-platform-parameters',
+      [],
+      deployer.address
+    );
+    
+    const updatedParams = platformParams.result.expectTuple();
+    assertEquals(updatedParams['emergency-halt'], 'true');
+    
+    // Non-owner should not be able to modify emergency halt
+    const nonOwner = accounts.get('wallet_2')!;
+    block = chain.mineBlock([
+      Tx.contractCall('revenue-sharing-token-platform', 'emergency-shutdown', [
+        types.bool(false)
+      ], nonOwner.address)
+    ]);
+    
+    // Should fail with error 100 (err-owner-only)
+    assertEquals(getErrCode(block.receipts[0]), 100);
+  }
+});
+
+Clarinet.test({
+  name: "Direct token transfer functionality works correctly",
+  async fn(chain: Chain, accounts: Map<string, Account>) {
+    const deployer = accounts.get('deployer')!;
+    const treasury = accounts.get('wallet_1')!;
+    const projectCreator = accounts.get('wallet_2')!;
+    const verifier1 = accounts.get('wallet_3')!;
+    const tokenHolder = accounts.get('wallet_4')!;
+    const recipient = accounts.get('wallet_5')!;
+    
+    // Initialize platform and create project
+    chain.mineBlock([
+      // Initialize platform
+      Tx.contractCall('revenue-sharing-token-platform', 'initialize', [
+        types.principal(treasury.address)
+      ], deployer.address),
+      
+      // Authorize verifier
+      Tx.contractCall('revenue-sharing-token-platform', 'authorize-verifier', [
+        types.principal(verifier1.address),
+        types.list([types.ascii("finance"), types.ascii("technical")])
+      ], deployer.address),
+      
+      // Create project with immediate trading
+      Tx.contractCall('revenue-sharing-token-platform', 'create-project', [
+        types.ascii("Test Project"), // name
+        types.utf8("Test description"), // description
+        types.ascii("TEST"), // token-symbol
+        types.uint(10000000), // total-supply
+        types.uint(2000), // revenue-percentage
+        types.uint(4320), // revenue-period
+        types.uint(518400), // duration
+        types.uint(1000000), // token-price
+        types.uint(50000000), // min-investment
+        types.uint(5000000000), // max-investment
+        types.bool(true), // trading-enabled
+        types.uint(0), // trading-delay (immediate)
+        types.uint(300), // trading-fee
+        types.utf8("https://example.com/metadata"), // metadata-url
+        types.ascii("test"), // category
+        types.list([types.principal(verifier1.address)]) // verifiers
+      ], projectCreator.address),
+      
+      // Token holder buys tokens
+      Tx.contractCall('revenue-sharing-token-platform', 'buy-tokens', [
+        types.uint(1), // project_id
+        types.uint(1000) // token_amount
+      ], tokenHolder.address)
+    ]);
+    
+    // Check initial balances
+    let holderBalance = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-token-balance',
+      [types.uint(1), types.principal(tokenHolder.address)],
+      deployer.address
+    );
+    
+    let recipientBalance = chain.callReadOnlyFn(
+      'revenue-sharing-token-platform',
+      'get-token-balance',
+      [types.uint(1), types.principal(recipient.address)],
+      deployer.address
+    );
